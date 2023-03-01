@@ -18,7 +18,7 @@ import wandb
 
 from thre3d_atom.data.datasets import PosedImagesDataset
 from thre3d_atom.data.utils import infinite_dataloader
-from thre3d_atom.modules.testers import test_sh_vox_grid_vol_mod_with_posed_images
+#from thre3d_atom.modules.testers import test_sh_vox_grid_vol_mod_with_posed_images
 from thre3d_atom.modules.volumetric_model import VolumetricModel
 from thre3d_atom.rendering.volumetric.utils.misc import (
     cast_rays,
@@ -51,6 +51,7 @@ from thre3d_atom.visualizations.static import (
 )
 
 dir_to_num_dict = {'side': 0, 'overhead': 1, 'back': 2, 'front': 3}
+mse_loss = torch.nn.MSELoss(reduction='none')
 
 
 # TrainProcedure = Callable[[VolumetricModel, Dataset, ...], VolumetricModel]
@@ -89,7 +90,8 @@ def train_attn_grid(
         directional_dataset: bool = False,
         use_uncertainty: bool = False,
         new_frame_frequency: int = 1,
-        attn_weight: int = 1
+        attn_weight: int = 1,
+        attn_tv_weight: float = 0.001,
 ) -> VolumetricModel:
     """
     ------------------------------------------------------------------------------------------------------
@@ -329,12 +331,16 @@ def train_attn_grid(
                 # log inputs
                 if directional_dataset:
                     direction_batch = get_dir_batch_from_poses(poses[selected_idx_in_batch])
-                    wandb.log({"Input Direction": dir_to_num_dict[direction_batch[0]]}  , step=global_step)
+                    wandb.log({"Input Direction": dir_to_num_dict[direction_batch[0]]}, step=global_step)
                 out_imgs = rendered_output.colour.unsqueeze(0)
                 out_imgs = out_imgs.permute((0, 3, 1, 2)).to(vol_mod.device)
-                m_prompt = prompt + f", {direction_batch} view"
+                m_prompt = prompt + f", {direction_batch[0]} view"
                 gt, t = sd_model.get_attn_map(prompt=[m_prompt], pred_rgb=out_imgs, timestamp=timestamp,
                                               indices_to_alter=indices_to_attn)
+
+                # normalize attention map:
+                # gt = (gt - gt.min()) / (gt.max() - gt.min())
+
                 cmp = cm.get_cmap('jet')
                 norm = colors.Normalize(vmin=0, vmax=torch.max(gt).item())
                 attn_frame = cmp(norm(gt.cpu()))[:, :, :3]
@@ -360,28 +366,51 @@ def train_attn_grid(
                 total_loss = total_loss + torch.mean(logvars_batch)
             else:
                 logvars_batch = None
-            specular_rendered_pixels_batch_attn = 1 - specular_rendered_pixels_batch_attn.reshape(gt.shape)
-            norm = colors.Normalize(vmin=0, vmax=torch.max(specular_rendered_pixels_batch_attn).item())
-            pred_attn_frame = cmp(norm(specular_rendered_pixels_batch_attn.cpu().detach().numpy()))[:, :, :3]
-            wandb.log({"Pred Attn Map": wandb.Image(pred_attn_frame)}, step=global_step)
-            filtered_idxs = torch.nonzero(
-                torch.where(specular_rendered_pixels_batch_attn > 0.1, specular_rendered_pixels_batch_attn, 0),
-                as_tuple=True)
+
+            specular_rendered_pixels_batch_attn = specular_rendered_pixels_batch_attn.reshape(gt.shape)
+
+            # get mask where attn grid render is not negative, i.e. where there is density
+            non_zero_mask = specular_rendered_pixels_batch_attn > 0.0
             mask = torch.zeros_like(gt)
-            mask[filtered_idxs] = 1
+            mask[non_zero_mask] = 1
+
+            # visualize mask
             norm = colors.Normalize(vmin=0, vmax=torch.max(mask).item())
             mask_frame = cmp(norm(mask.cpu()))[:, :, :3]
-            wandb.log({"Mask": wandb.Image(mask_frame)},step=global_step)
-            diff = torch.abs(specular_rendered_pixels_batch_attn - torch.clamp(gt * attn_weight,0,1))
+            wandb.log({"Mask": wandb.Image(mask_frame)}, step=global_step)
+
+            # visualize attn grid render
+            specular_rendered_pixels_batch_attn_vis = specular_rendered_pixels_batch_attn.detach()
+            # get rid of large difference between background and foreground caused by -1
+            specular_rendered_pixels_batch_attn_vis[
+                specular_rendered_pixels_batch_attn <= 0.0] = specular_rendered_pixels_batch_attn.min()
+            norm = colors.Normalize(vmin=0, vmax=torch.max(specular_rendered_pixels_batch_attn_vis).item())
+            pred_attn_frame = cmp(norm(specular_rendered_pixels_batch_attn_vis.cpu().detach().numpy()))[:, :, :3]
+            wandb.log({"Pred Attn Map": wandb.Image(pred_attn_frame)}, step=global_step)
+
+            # calc loss:
+            # diff = mse_loss(specular_rendered_pixels_batch_attn, gt)
+            # diff1 = torch.abs(specular_rendered_pixels_batch_attn - torch.clamp(gt * attn_weight,0,1))
+            diff = torch.abs(specular_rendered_pixels_batch_attn - gt)
+
+            # visualize loss
             norm = colors.Normalize(vmin=0, vmax=torch.max(diff).item())
             diff_frame = cmp(norm(diff.cpu().detach().numpy()))[:, :, :3]
-            wandb.log({"Diff": wandb.Image(diff_frame)},step=global_step)
-            diff_masked = torch.mul(diff, mask)
+            wandb.log({"Diff": wandb.Image(diff_frame)}, step=global_step)
+
+            # calc masked diff
+            diff_masked = diff * mask.float()
+
+            # visualize diff mask
             norm = colors.Normalize(vmin=0, vmax=torch.max(diff_masked).item())
-            diff_mask_frame = cmp(norm(diff.cpu().detach().numpy()))[:, :, :3]
-            wandb.log({"Diff Masked": wandb.Image(diff_mask_frame)},step=global_step)
-            attn_loss = torch.mean(diff_masked) * (torch.numel(gt) / mask.sum())
+            diff_mask_frame = cmp(norm(diff_masked.cpu().detach().numpy()))[:, :, :3]
+            wandb.log({"Diff Masked": wandb.Image(diff_mask_frame)}, step=global_step)
+
+            attn_loss = diff_masked.sum() / mask.sum()
             total_loss = total_loss + attn_loss
+
+            tv_loss = _tv_loss_on_grid(vol_mod.thre3d_repr.attn)
+            total_loss = total_loss + tv_loss * attn_tv_weight
 
             # optimization steps:
             total_loss.backward()
@@ -392,6 +421,7 @@ def train_attn_grid(
             if use_uncertainty:
                 _log_variances_in_wandb(logvars, global_step)
             wandb.log({"attn_loss": attn_loss}, step=global_step)
+            wandb.log({"tv_loss": tv_loss}, step=global_step)
             wandb.log({"total_loss": total_loss}, step=global_step)
             wandb.log({"first selected indx in batch": index_batch[0]}, step=global_step)
 
@@ -592,3 +622,10 @@ def _pitch_yaw_from_Rt(rotation: Tensor):
     pitch = np.arctan(tz / tr) * 180 / np.pi
     yaw = np.arccos(rotation[0, 0].cpu().numpy()) * 180.0 / np.pi
     return pitch, yaw
+
+
+def _tv_loss_on_grid(grid: Tensor):
+    tv0 = grid.diff(dim=0).abs()
+    tv1 = grid.diff(dim=1).abs()
+    tv2 = grid.diff(dim=2).abs()
+    return (tv0.mean() + tv1.mean() + tv2.mean()) / 3

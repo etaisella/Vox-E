@@ -103,11 +103,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
               help="number of samples taken per ray during training", show_default=True)
 @click.option("--num_stages", type=click.INT, required=False, default=1,
               help="number of progressive growing stages used in training", show_default=True)
-@click.option("--num_iterations_per_stage", type=click.INT, required=False, default=2000,
+@click.option("--num_iterations_per_stage", type=click.INT, required=False, default=5000,
               help="number of training iterations performed per stage", show_default=True)
 @click.option("--scale_factor", type=click.FLOAT, required=False, default=2.0,
               help="factor by which the grid is up-scaled after each stage", show_default=True)
-@click.option("--learning_rate", type=click.FLOAT, required=False, default=0.025,
+@click.option("--learning_rate", type=click.FLOAT, required=False, default=0.08,
               help="learning rate used at the beginning (ADAM OPTIMIZER)", show_default=True)
 @click.option("--lr_decay_steps_per_stage", type=click.INT, required=False, default=5000 * 100,
               help="number of iterations after which lr is exponentially decayed per stage", show_default=True)
@@ -150,6 +150,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
               help="number of iterations where we work on the same pose", show_default=True)
 @click.option("--attn_weight", type=click.INT, required=False, default=10,
               help="number of iterations where we work on the same pose", show_default=True)
+@click.option("--tv_weight", type=click.FLOAT, required=False, default=0.001,
+              help="tv loss weight", show_default=True)
+
 # fmt: on
 # -------------------------------------------------------------------------------------
 def main(**kwargs) -> None:
@@ -220,7 +223,8 @@ def main(**kwargs) -> None:
         directional_dataset=config.directional_dataset,
         use_uncertainty=config.use_uncertainty,
         new_frame_frequency=config.new_frame_frequency,
-        attn_weight=config.attn_weight
+        attn_weight=config.attn_weight,
+        attn_tv_weight=config.tv_weight
     )
 
 

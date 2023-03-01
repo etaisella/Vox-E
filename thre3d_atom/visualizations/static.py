@@ -129,7 +129,7 @@ def _process_rendered_output_for_feedback_log_attn(
     colour_map = to8b(rendered_output.colour.cpu().numpy())
     # invert the acc_map for better looking visualization
     attn_frame = rendered_output_attn.attn.squeeze(-1).cpu().numpy()
-    attn_frame = 1- attn_frame
+    #attn_frame = 1- attn_frame
     cmp=cm.get_cmap('jet')
     norm = colors.Normalize(vmin=np.min(attn_frame), vmax=np.max(attn_frame))
     attn_frame = cmp(norm(attn_frame))[:, :, :3]

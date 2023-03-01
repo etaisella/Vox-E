@@ -124,7 +124,6 @@ class StableDiffusion(nn.Module):
         return text_embeddings
 
     def get_attn_map(self, prompt, pred_rgb, timestamp=0, indices_to_alter=[7], guidance_scale=100,  logvar=None):
-        prompt = [prompt]
         batch_size = len(prompt)
         controller = ca.AttentionStore()
         ca.register_attention_control(self.unet, controller)

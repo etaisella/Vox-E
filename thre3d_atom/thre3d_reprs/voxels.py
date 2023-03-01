@@ -112,13 +112,8 @@ class VoxelGrid(Module):
         if tunable:
             self._densities = torch.nn.Parameter(self._densities)
             self._features = torch.nn.Parameter(self._features)
-<<<<<<< HEAD
             if attn is not None:
                 self.attn = torch.nn.Parameter(self.attn)
-
-=======
-            
->>>>>>> a9f9d4b4c2869b41adbd72213e473e8fb7aca64c
 
         # either densities or features can be used:
         self._device = features.device
@@ -505,8 +500,8 @@ def create_voxel_grid_from_saved_info_dict(saved_info: Dict[str, Any]) -> VoxelG
 def create_voxel_grid_from_saved_info_dict_attn(saved_info: Dict[str, Any], load_attn=False) -> VoxelGrid:
     densities = torch.empty_like(saved_info[THRE3D_REPR][STATE_DICT][u_DENSITIES])
     features = torch.empty_like(saved_info[THRE3D_REPR][STATE_DICT][u_FEATURES])
-    # attn = torch.zeros_like(densities) - 0.5
-    attn = torch.ones_like(densities)
+    #attn = torch.zeros_like(densities) - 35.
+    attn = torch.ones_like(densities) * (-35.0)
     if load_attn:
         attn = torch.empty_like(saved_info[THRE3D_REPR][STATE_DICT][u_ATTN])
         voxel_grid = VoxelGrid(
