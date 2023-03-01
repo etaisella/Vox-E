@@ -1,10 +1,10 @@
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Any, List
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from thre3d_atom.rendering.volumetric.render_interface import Rays, RenderOut
+from thre3d_atom.rendering.volumetric.render_interface import Rays, RenderOut, RenderOutAttn
 from thre3d_atom.utils.constants import NUM_COORD_DIMENSIONS
 from thre3d_atom.utils.imaging_utils import CameraIntrinsics, CameraPose
 
@@ -142,7 +142,7 @@ def sample_rays_and_pixels_synchronously(
     pixels: Tensor,
     indices: list,
     sample_size: int,
-) -> Tuple[Rays, Tensor]:
+): #-> tuple[Rays, Any, list[list[Any] | Any] | list[Any] | Any, Any]:
     dtype, device = pixels.dtype, pixels.device
     permutation = torch.randperm(pixels.shape[0], dtype=torch.long, device=device)
     sampled_subset = permutation[:sample_size]
@@ -200,6 +200,24 @@ def collate_rendered_output(rendered_chunks: Sequence[RenderOut]) -> RenderOut:
     # return the collated rendered_output
     return RenderOut(colour=colour, depth=depth, extra=extra)
 
+def collate_rendered_output_attn(rendered_chunks: Sequence[RenderOutAttn]) -> RenderOutAttn:
+    """Defines how a sequence of rendered_chunks can be
+    collated into a render_out"""
+    # collect all the rendered_chunks into lists
+    attn, depth, extra = [], [], {}
+    for rendered_chunk in rendered_chunks:
+        attn.append(rendered_chunk.attn)
+        depth.append(rendered_chunk.depth)
+        for key, value in rendered_chunk.extra.items():
+            extra[key] = extra.get(key, []) + [value]
+
+    # combine all the tensor information
+    attn = torch.cat(attn, dim=0)
+    depth = torch.cat(depth, dim=0)
+    extra = {key: torch.cat(extra[key], dim=0) for key in extra}
+
+    # return the collated rendered_output
+    return RenderOutAttn(attn=attn, depth=depth, extra=extra)
 
 def reshape_rendered_output(
     rendered_output: RenderOut, camera_intrinsics: CameraIntrinsics
@@ -207,6 +225,19 @@ def reshape_rendered_output(
     new_shape = (camera_intrinsics.height, camera_intrinsics.width, -1)
     return RenderOut(
         colour=rendered_output.colour.reshape(*new_shape),
+        depth=rendered_output.depth.reshape(*new_shape),
+        extra={
+            key: value.reshape(*new_shape)
+            for key, value in rendered_output.extra.items()
+        },
+    )
+
+def reshape_rendered_output_attn(
+    rendered_output: RenderOutAttn, camera_intrinsics: CameraIntrinsics
+) -> RenderOutAttn:
+    new_shape = (camera_intrinsics.height, camera_intrinsics.width, -1)
+    return RenderOutAttn(
+        attn=rendered_output.attn.reshape(*new_shape),
         depth=rendered_output.depth.reshape(*new_shape),
         extra={
             key: value.reshape(*new_shape)

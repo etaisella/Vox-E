@@ -1,21 +1,27 @@
+import cv2
+import numpy as np
 from transformers import CLIPTextModel, CLIPTokenizer, logging
 from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler
-import thre3d_atom.thre3d_reprs.cross_attn as ca
+import matplotlib.pyplot as plt
+
+from thre3d_atom.thre3d_reprs.cross_attn import AttentionStore
+
 # suppress partial model loading warning
 logging.set_verbosity_error()
-
+import thre3d_atom.thre3d_reprs.cross_attn as ca
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import time
 from torch.cuda.amp import custom_bwd, custom_fwd
+
 
 def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    #torch.backends.cudnn.deterministic = True
-    #torch.backends.cudnn.benchmark = True
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = True
+
 
 class SpecifyGradient(torch.autograd.Function):
     @staticmethod
@@ -33,27 +39,20 @@ class SpecifyGradient(torch.autograd.Function):
         batch_size = len(gt_grad)
         return gt_grad / batch_size, None
 
+
 def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    #torch.backends.cudnn.deterministic = True
-    #torch.backends.cudnn.benchmark = True
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = True
 
 
 class StableDiffusion(nn.Module):
-    def __init__(self, device,
-                 sd_version='2.1',
-                 hf_key=None,
-                 t_sched_start = 1500,
-                 t_sched_freq = 500,
-                 t_sched_gamma = 1.0,):
+    def __init__(self, device, sd_version='2.1', hf_key=None):
         super().__init__()
 
         self.device = device
         self.sd_version = sd_version
-        self.t_sched_start = t_sched_start
-        self.t_sched_freq = t_sched_freq
-        self.t_sched_gamma = t_sched_gamma
 
         print(f'[INFO] loading stable diffusion...')
 
@@ -76,45 +75,38 @@ class StableDiffusion(nn.Module):
         # Create model
         self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae", use_auth_token=use_auth_token).to(
             self.device)
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer",
-                                                       use_auth_token=use_auth_token)
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer", use_auth_token=use_auth_token)
         self.text_encoder = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder",
                                                           use_auth_token=use_auth_token).to(self.device)
-        self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet",
-                                                         use_auth_token=use_auth_token).to(
+        self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet", use_auth_token=use_auth_token).to(
             self.device)
 
-        self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler",
-                                                       use_auth_token=use_auth_token)
+        self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", use_auth_token=use_auth_token)
         # self.scheduler = PNDMScheduler.from_pretrained(model_key, subfolder="scheduler")
 
         self.num_train_timesteps = self.scheduler.config.num_train_timesteps
         self.scheduler.set_timesteps(self.scheduler.config.num_train_timesteps, self.device)
-
-        self.min_step_ratio = 0.02
-        self.min_step = int(self.num_train_timesteps * self.min_step_ratio)
-
-        self.max_step_ratio = 0.98
-        self.max_step = int(self.num_train_timesteps * self.max_step_ratio)
-
-        self.alphas = self.scheduler.alphas_cumprod.to(self.device) # for convenience
+        self.min_step = int(self.num_train_timesteps * 0.02)
+        self.max_step = int(self.num_train_timesteps * 0.98)
+        self.alphas = self.scheduler.alphas_cumprod.to(self.device)  # for convenience
 
         print(f'[INFO] loaded stable diffusion!')
 
-    def get_max_step_ratio(self):
-        return self.max_step_ratio
-
     def get_text_embeds(self, prompt, negative_prompt):
         # prompt, negative_prompt: [str]
+        batch_size = len(prompt)
 
         # Tokenize text and get embeddings
-        text_input = self.tokenizer(prompt, padding='max_length', max_length=self.tokenizer.model_max_length, truncation=True, return_tensors='pt')
+        text_input = self.tokenizer(prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
+                                    truncation=True, return_tensors='pt')
 
         with torch.no_grad():
             text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
 
         # Do the same for unconditional embeddings
-        uncond_input = self.tokenizer(negative_prompt, padding='max_length', max_length=self.tokenizer.model_max_length, return_tensors='pt')
+        uncond_input = self.tokenizer([""] * batch_size, padding='max_length',
+                                      max_length=self.tokenizer.model_max_length,
+                                      return_tensors='pt')
 
         with torch.no_grad():
             uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
@@ -156,19 +148,33 @@ class StableDiffusion(nn.Module):
         return attn_maps[0], t.item()
 
 
-    def train_step(self, text_embeddings, pred_rgb, guidance_scale=100, global_step=-1, logvar=None):
-        # schedule max step:
-        if global_step >= self.t_sched_start and global_step % self.t_sched_freq == 0:
-            self.max_step_ratio = self.max_step_ratio * self.t_sched_gamma
-            if self.max_step_ratio < self.min_step_ratio * 2:
-                self.max_step_ratio = self.min_step_ratio * 2 # don't let it get too low!
+
+    def train_step(self, dir, indices_to_alter, prompts_dir, text_embeddings, pred_rgb, blend_word, guidance_scale=100,
+                   logvar=None, extra_noise=False, extra_attn='', use_controllers=False, input_idx=0, controllers=None):
+        batch_size = len(prompts_dir[dir])
+        lb = None
+        if len(blend_word) > 0:
+            lb = ca.LocalBlend(self.tokenizer, prompts_dir[dir], (blend_word, blend_word), device=self.device)
+        controller = ca.AttentionRefine(self.tokenizer, prompts_dir[dir], self.num_train_timesteps,
+                                        cross_replace_steps=1.,
+                                        self_replace_steps=1., local_blend=lb, device=self.device)
+        if len(extra_attn) > 0:
+            controller_a = controller
+            equalizer = ca.get_equalizer(self.tokenizer, prompts_dir[dir][1], (extra_attn,), (5,))
+            controller = ca.AttentionReweight(self.tokenizer, prompts_dir[dir], self.num_train_timesteps,
+                                              cross_replace_steps=1.,
+                                              self_replace_steps=1., equalizer=equalizer, local_blend=lb,
+                                              controller=controller_a)
+        if use_controllers:
+            if input_idx in controllers:
+                controller = controllers[input_idx]
             else:
-                print(f"Updating max step to {self.max_step_ratio}")
-
-        self.max_step = int(self.num_train_timesteps * self.max_step_ratio)
-
+                controllers[input_idx] = controller
+        ca.register_attention_control(self.unet, controller)
         # interp to 512x512 to be fed into vae.
+
         # _t = time.time()
+        orig_im_h, orig_im_w = pred_rgb.shape[-2:]
         pred_rgb_512 = F.interpolate(pred_rgb, (512, 512), mode='bilinear', align_corners=False)
         # torch.cuda.synchronize(); print(f'[TIME] guiding: interp {time.time() - _t:.4f}s')
 
@@ -178,6 +184,7 @@ class StableDiffusion(nn.Module):
         # encode image into latents with vae, requires grad!
         # _t = time.time()
         latents = self.encode_imgs(pred_rgb_512)
+        latents = latents.expand(batch_size, self.unet.in_channels, 512 // 8, 512 // 8).to(self.device)
         # torch.cuda.synchronize(); print(f'[TIME] guiding: vae enc {time.time() - _t:.4f}s')
 
         # predict the noise residual with unet, NO grad!
@@ -189,12 +196,30 @@ class StableDiffusion(nn.Module):
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * 2)
             noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
-        # torch.cuda.synchronize(); print(f'[TIME] guiding: unet {time.time() - _t:.4f}s')
-
-        # perform guidance (high scale from paper!)
+            attn_maps = None
+            if indices_to_alter is not None:
+                attn_maps = ca.aggregate_and_get_max_attention_per_token(
+                    prompts=prompts_dir[dir],
+                    attention_store=controller,
+                    indices_to_alter=indices_to_alter, orig_im_h=orig_im_h, orig_im_w=orig_im_h
+                )
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
         noise_pred = noise_pred_text + guidance_scale * (noise_pred_text - noise_pred_uncond)
+        latents = self.scheduler.step(noise_pred, t, latents)["prev_sample"]
+        if extra_noise:
+            denoised = latents.clone().detach()
+        latents = controller.step_callback(latents)
+        if extra_noise:
+            noise_pred = noise_pred + (denoised - latents)
 
+            # torch.cuda.synchronize(); print(f'[TIME] guiding: unet {time.time() - _t:.4f}s')
+
+        # perform guidance (high scale from paper!)
+
+        # if global_step % 101 == 1 or global_step == 1:
+        #     attn = show_cross_attention(self.tokenizer, prompts_dir[dir], controller, res=16,
+        #                                 from_where=("up", "mid", "down"))
+        #     a = 1
         # w(t), sigma_t^2
         w = (1 - self.alphas[t])
         # w = self.alphas[t] ** 0.5 * (1 - self.alphas[t])
@@ -211,13 +236,16 @@ class StableDiffusion(nn.Module):
         # _t = time.time()
         loss = SpecifyGradient.apply(latents, grad)
         # torch.cuda.synchronize(); print(f'[TIME] guiding: backward {time.time() - _t:.4f}s')
+        # image = latent2image(self.vae, latents)
+        # attn = show_cross_attention(self.tokenizer, prompt, controller, res=16, from_where=("up", "down"))
+        return loss, attn_maps
 
-        return loss
-
-    def produce_latents(self, text_embeddings, height=512, width=512, num_inference_steps=50, guidance_scale=7.5, latents=None):
+    def produce_latents(self, text_embeddings, height=512, width=512, num_inference_steps=50, guidance_scale=7.5,
+                        latents=None):
 
         if latents is None:
-            latents = torch.randn((text_embeddings.shape[0] // 2, self.unet.in_channels, height // 8, width // 8), device=self.device)
+            latents = torch.randn((text_embeddings.shape[0] // 2, self.unet.in_channels, height // 8, width // 8),
+                                  device=self.device)
 
         self.scheduler.set_timesteps(num_inference_steps)
 
@@ -260,7 +288,8 @@ class StableDiffusion(nn.Module):
 
         return latents
 
-    def prompt_to_img(self, prompts, negative_prompts='', height=512, width=512, num_inference_steps=50, guidance_scale=7.5, latents=None):
+    def prompt_to_img(self, prompts, negative_prompts='', height=512, width=512, num_inference_steps=50,
+                      guidance_scale=7.5, latents=None):
 
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -269,13 +298,15 @@ class StableDiffusion(nn.Module):
             negative_prompts = [negative_prompts]
 
         # Prompts -> text embeds
-        text_embeds = self.get_text_embeds(prompts, negative_prompts) # [2, 77, 768]
+        text_embeds = self.get_text_embeds(prompts, negative_prompts)  # [2, 77, 768]
 
         # Text embeds -> img latents
-        latents = self.produce_latents(text_embeds, height=height, width=width, latents=latents, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale) # [1, 4, 64, 64]
+        latents = self.produce_latents(text_embeds, height=height, width=width, latents=latents,
+                                       num_inference_steps=num_inference_steps,
+                                       guidance_scale=guidance_scale)  # [1, 4, 64, 64]
 
         # Img latents -> imgs
-        imgs = self.decode_latents(latents) # [1, 3, 512, 512]
+        imgs = self.decode_latents(latents)  # [1, 3, 512, 512]
 
         # Img to Numpy
         imgs = imgs.detach().cpu().permute(0, 2, 3, 1).numpy()
@@ -285,14 +316,14 @@ class StableDiffusion(nn.Module):
 
 
 if __name__ == '__main__':
-
     import argparse
     import matplotlib.pyplot as plt
 
     parser = argparse.ArgumentParser()
     parser.add_argument('prompt', type=str)
     parser.add_argument('--negative', default='', type=str)
-    parser.add_argument('--sd_version', type=str, default='2.0', choices=['1.5', '2.0'], help="stable diffusion version")
+    parser.add_argument('--sd_version', type=str, default='2.0', choices=['1.5', '2.0'],
+                        help="stable diffusion version")
     parser.add_argument('-H', type=int, default=512)
     parser.add_argument('-W', type=int, default=512)
     parser.add_argument('--seed', type=int, default=0)
@@ -311,39 +342,36 @@ if __name__ == '__main__':
     plt.imshow(imgs[0])
     plt.show()
 
+
 class scoreDistillationLoss(nn.Module):
     def __init__(self,
                  device,
-                 prompt,
-                 t_sched_start = 1500,
-                 t_sched_freq = 500,
-                 t_sched_gamma = 1.0,
-                 directional = False):
+                 prompts,
+                 directional=False, blend_word=''):
         super().__init__()
         self.dir_to_indx_dict = {}
         self.directional = directional
         # get sd model
-        #self.sd_model = StableDiffusion(device,"2.0", hf_key="Fictiverse/Stable_Diffusion_VoxelArt_Model")
-        self.sd_model = StableDiffusion(device,
-                                        "2.0",
-                                        t_sched_start=t_sched_start,
-                                        t_sched_freq=t_sched_freq,
-                                        t_sched_gamma=t_sched_gamma)
-
+        # self.sd_model = StableDiffusion(device,"2.0", hf_key="Fictiverse/Stable_Diffusion_VoxelArt_Model")
+        self.sd_model = StableDiffusion(device, "1.4")
+        self.blend_word = blend_word
+        self.controllers = {}
         # encode text
         if directional:
             self.text_encodings = {}
+            self.prompts = {}
             for dir_prompt in ['side', 'overhead', 'back', 'front']:
                 print(f"Encoding text for \'{dir_prompt}\' direction")
-                modified_prompt = prompt + f", {dir_prompt} view"
+                modified_prompt = [prompt + f", {dir_prompt} view" for prompt in prompts] if \
+                    isinstance(prompts, list) else prompts + f", {dir_prompt} view"
+                self.prompts[dir_prompt] = modified_prompt if isinstance(prompts, list) else [modified_prompt]
                 self.text_encodings[dir_prompt] = self.sd_model.get_text_embeds(modified_prompt, '')
+            # self.sd_model.set_ca(self.prompts)
         else:
-            self.text_encoding = self.sd_model.get_text_embeds(prompt, '')
+            self.text_encoding = self.sd_model.get_text_embeds(prompts, '')
 
-    def get_current_max_step_ratio(self):
-        return self.sd_model.get_max_step_ratio()
-
-    def training_step(self, output, image_height, image_width, directions=None, global_step=-1, logvars=None):
+    def training_step(self, indices_to_alter, output, image_height, image_width, global_step, directions=None,
+                      logvars=None, extra_noise=False, extra_attn='', controllers=False, input_idx=0):
         loss = 0
         if self.directional:
             assert (directions != None), f"Must supply direction if SDS loss is set to directional mode"
@@ -353,7 +381,7 @@ class scoreDistillationLoss(nn.Module):
 
         # perform training step
         if not self.directional:
-            loss = self.sd_model.train_step(self.text_encoding, out_imgs, global_step=global_step, logvar=logvars)
+            loss = self.sd_model.train_step(global_step, self.text_encoding, out_imgs, logvar=logvars)
         else:
             for idx, dir_prompt in enumerate(directions):
                 if logvars != None:
@@ -361,6 +389,11 @@ class scoreDistillationLoss(nn.Module):
                 else:
                     logvar = None
                 encoding = self.text_encodings[dir_prompt]
-                loss = loss + self.sd_model.train_step(encoding, out_imgs, global_step=global_step, logvar=logvar)
+                loss_sds, attn_maps = self.sd_model.train_step(dir_prompt, indices_to_alter, self.prompts, encoding,
+                                                               out_imgs, self.blend_word,
+                                                               logvar=logvar, extra_noise=extra_noise,
+                                                               extra_attn=extra_attn, use_controllers=controllers, input_idx=input_idx,
+                                                               controllers=self.controllers)
+                loss = loss + loss_sds
 
-        return loss
+        return loss, attn_maps

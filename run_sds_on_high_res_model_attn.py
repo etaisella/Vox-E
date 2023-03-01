@@ -9,7 +9,7 @@ from easydict import EasyDict
 from torch.backends import cudnn
 
 from thre3d_atom.data.datasets import PosedImagesDataset
-from thre3d_atom.modules.sds_trainer import train_sh_vox_grid_vol_mod_with_posed_images_and_sds
+from thre3d_atom.modules.sds_trainer_attn import train_sh_vox_grid_vol_mod_with_posed_images_and_sds
 from thre3d_atom.modules.volumetric_model import (
     VolumetricModel,
     create_volumetric_model_from_saved_model,
@@ -51,7 +51,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
               required=True, help="path to the pre-trained high-res model")
 @click.option("-o", "--output_path", type=click.Path(file_okay=False, dir_okay=True),
               required=True, help="path for training output")
-@click.option("-p", "--prompt", type=click.STRING, required=True,
+@click.option("-p", "--sds_prompt", type=click.STRING, required=True,
               help="sds prompt used for SDS based loss")
 
 # Input dataset related arguments:
@@ -59,11 +59,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
               default=True, help="whether the data directory has separate train and test folders", 
               show_default=True)
 @click.option("--data_downsample_factor", type=click.FloatRange(min=1.0), required=False,
-              default=3.0, help="downscale factor for the input images if needed."
+              default=4.0, help="downscale factor for the input images if needed."
                                 "Note the default, for training NeRF-based scenes", show_default=True)
 
 # Voxel-grid related arguments:
-@click.option("--grid_dims", type=click.INT, nargs=3, required=False, default=(160, 160, 160),
+@click.option("--grid_dims", type=click.INT, nargs=3, required=False, default=(128, 128, 128),
               help="dimensions (#voxels) of the grid along x, y and z axes", show_default=True)
 @click.option("--grid_location", type=click.FLOAT, nargs=3, required=False, default=(0.0, 0.0, 0.0),
               help="dimensions (#voxels) of the grid along x, y and z axes", show_default=True)
@@ -96,24 +96,24 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
               show_default=True)  # this option is also used in pre-processing the dataset
 
 # Training related arguments:
-@click.option("--ray_batch_size", type=click.INT, required=False, default=65536 * 1.25,
+@click.option("--ray_batch_size", type=click.INT, required=False, default=65536,
               help="number of randomly sampled rays used per training iteration", show_default=True)
 @click.option("--train_num_samples_per_ray", type=click.INT, required=False, default=256,
               help="number of samples taken per ray during training", show_default=True)
 @click.option("--num_stages", type=click.INT, required=False, default=1,
               help="number of progressive growing stages used in training", show_default=True)
-@click.option("--num_iterations_per_stage", type=click.INT, required=False, default=8000,
+@click.option("--num_iterations_per_stage", type=click.INT, required=False, default=5000,
               help="number of training iterations performed per stage", show_default=True)
 @click.option("--scale_factor", type=click.FLOAT, required=False, default=2.0,
               help="factor by which the grid is up-scaled after each stage", show_default=True)
 @click.option("--learning_rate", type=click.FLOAT, required=False, default=0.025,
               help="learning rate used at the beginning (ADAM OPTIMIZER)", show_default=True)
-@click.option("--lr_freq", type=click.INT, required=False, default=400,
-              help="frequency in which to reduce learning rate", show_default=True)
-@click.option("--lr_decay_start", type=click.INT, required=False, default=5000,
-              help="step in which to start decreasing learning rate", show_default=True)
-@click.option("--lr_gamma", type=click.FLOAT, required=False, default=0.96,
+@click.option("--lr_decay_steps_per_stage", type=click.INT, required=False, default=5000*100,
+              help="number of iterations after which lr is exponentially decayed per stage", show_default=True)
+@click.option("--lr_decay_gamma_per_stage", type=click.FLOAT, required=False, default=0.1,
               help="value of gamma for exponential lr_decay (happens per stage)", show_default=True)
+@click.option("--stagewise_lr_decay_gamma", type=click.FLOAT, required=False, default=0.9,
+              help="value of gamma used for reducing the learning rate after each stage", show_default=True)
 @click.option("--apply_diffuse_render_regularization", type=click.BOOL, required=False, default=True,
               help="whether to apply the diffuse render regularization."
                    "this is a weird conjure of mine, where we ask the diffuse render "
@@ -146,33 +146,45 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
               help="diffuse weight used for regularization", show_default=True)
 @click.option("--specular_weight", type=click.FLOAT, required=False, default=0.0000001,
               help="specular weight used for regularization", show_default=True)
-@click.option("--directional_dataset", type=click.BOOL, required=False, default=True,
+@click.option("--directional_dataset", type=click.BOOL, required=False, default=False,
               help="whether to use a directional dataset for SDS where each view comes with a direction",
                show_default=True)
 @click.option("--use_uncertainty", type=click.BOOL, required=False, default=False,
               help="whether to use an uncertainty aware type loss",
                show_default=True)
-@click.option("--do_sds", type=click.BOOL, required=False, default=True,
-              help="whether to use an uncertainty aware type loss",
-               show_default=True)
 @click.option("--new_frame_frequency", type=click.INT, required=False, default=1,
               help="number of iterations where we work on the same pose", show_default=True)
-@click.option("--density_correlation_weight", type=click.FLOAT, required=False, default=200.0,
+@click.option("--density_correlation_weight", type=click.FLOAT, required=False, default=0.0,
               help="weight for density correlation loss", show_default=True)
-@click.option("--feature_correlation_weight", type=click.FLOAT, required=False, default=0.0,
-              help="weight for feature correlation loss", show_default=True)
-@click.option("--tv_density_weight", type=click.FLOAT, required=False, default=0.0,
-              help="weight for total variation loss on densities", show_default=True)
-@click.option("--tv_features_weight", type=click.FLOAT, required=False, default=0.0,
-              help="weight for total variation loss on densities", show_default=True)
+@click.option("--l1", type=click.BOOL, required=False, default=False,
+              help="l1 loss", show_default=True)
+@click.option("--dcl", type=click.BOOL, required=False, default=False,
+              help="dcl loss", show_default=True)
+@click.option("--avg", type=click.BOOL, required=False, default=False,
+              help="avg color and density", show_default=True)
+@click.option("--two_way", type=click.BOOL, required=False, default=False,
+              help="two way optimization", show_default=True)
+@click.option("--lbo", type=click.BOOL, required=False, default=True,
+              help="lower_branch", show_default=True)
+@click.option("--weight_schedule", type=click.BOOL, required=False, default=False,
+              help="lower_branch", show_default=True)
+@click.option("--rec_loss_weight", type=click.FLOAT, required=False, default=0.0,
+              help="weight for reconstruction loss", show_default=True)
+@click.option("--indices_to_alter", type=click.INT, required=False, default=7,
+              help="indices_to_alter", show_default=True)
+@click.option("--show_attn", type=click.BOOL, required=False, default=False,
+              help="show attention maps", show_default=True)
+@click.option("--edited_prompt", type=click.STRING, required=False, default='',
+              help="edited_prompt for P2P")
+@click.option("--blend_word", type=click.STRING, required=False, default='',
+              help="word for local blend")
+@click.option("--extra_noise", type=click.BOOL, required=False, default=False,
+              help="calc_noise")
+@click.option("--extra_attn", type=click.STRING, required=False, default='',
+              help="extra_attn")
+@click.option("--controllers", type=click.BOOL, required=False, default=False,
+              help="use input image controllers")
 
-# sds timestep scheduling:
-@click.option("--sds_t_freq", type=click.INT, required=False, default=600,
-              help="frequency in which to reduce the max timestep in sds", show_default=True)
-@click.option("--sds_t_start", type=click.INT, required=False, default=4000,
-              help="iteration in which to start reducing the max timestep in sds", show_default=True)
-@click.option("--sds_t_gamma", type=click.FLOAT, required=False, default=0.75,
-              help="max timestep reduction gamma", show_default=True)
 
 # fmt: on
 # -------------------------------------------------------------------------------------
@@ -180,7 +192,9 @@ def main(**kwargs) -> None:
     # load the requested configuration for the training
     config = EasyDict(kwargs)
 
-    wandb.init(project='VoxelArtReluFields v1.1', entity="etaisella",
+    wandb.login(key='ff94c0f010b9671bb533151afa9a1e60d30ee9a0')
+
+    wandb.init(project='VoxelArtReluFields v1.1', entity="galf",
                config=dict(config), name="test " + str(datetime.now()),
                id=wandb.util.generate_id())
     # parse os-checked path-strings into Pathlike Paths :)
@@ -233,9 +247,9 @@ def main(**kwargs) -> None:
         num_iterations_per_stage=config.num_iterations_per_stage,
         scale_factor=config.scale_factor,
         learning_rate=config.learning_rate,
-        lr_decay_start=config.lr_decay_start,
-        lr_freq=config.lr_freq,
-        lr_gamma=config.lr_gamma,
+        lr_decay_gamma_per_stage=config.lr_decay_gamma_per_stage,
+        lr_decay_steps_per_stage=config.lr_decay_steps_per_stage,
+        stagewise_lr_decay_gamma=config.stagewise_lr_decay_gamma,
         save_freq=config.save_frequency,
         test_freq=config.test_frequency,
         feedback_freq=config.feedback_frequency,
@@ -246,18 +260,25 @@ def main(**kwargs) -> None:
         fast_debug_mode=config.fast_debug_mode,
         diffuse_weight=config.diffuse_weight,
         specular_weight=config.specular_weight,
-        sds_prompt=config.prompt,
+        sds_prompt=config.sds_prompt,
         directional_dataset=config.directional_dataset,
         use_uncertainty=config.use_uncertainty,
         new_frame_frequency=config.new_frame_frequency,
         density_correlation_weight=config.density_correlation_weight,
-        feature_correlation_weight=config.feature_correlation_weight,
-        tv_density_weight=config.tv_density_weight,
-        tv_features_weight=config.tv_features_weight,
-        do_sds=config.do_sds,
-        sds_t_freq=config.sds_t_freq,
-        sds_t_start=config.sds_t_start,
-        sds_t_gamma=config.sds_t_gamma,
+        l1=config.l1,
+        dcl=config.dcl,
+        avg=config.avg,
+        two_way=config.two_way,
+        lbo=config.lbo,
+        weight_schedule=config.weight_schedule,
+        rec_loss_weight=config.rec_loss_weight,
+        indices_to_alter = [config.indices_to_alter],
+        show_attn=config.show_attn,
+        edited_prompt=config.edited_prompt,
+        blend_word=config.blend_word,
+        extra_noise=config.extra_noise,
+        extra_attn=config.extra_attn,
+        controllers=config.controllers
     )
 
 

@@ -13,3 +13,4 @@ u_IN_DENSITIES = "_in_densities"
 u_IN_FEATURES = "_in_features"
 u_RGBNET = "rgbnet"
 u_DENSITYNET = "densitynet"
+u_ATTN = 'attn'
